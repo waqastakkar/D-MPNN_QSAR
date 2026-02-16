@@ -84,6 +84,9 @@ def load_dmpnn_module(repo_root: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError("Could not import 04_train_dmpnn.py")
     mod = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     return mod
 
