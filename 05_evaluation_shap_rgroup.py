@@ -752,7 +752,9 @@ def run_rgroup_analysis(
         if core is None:
             continue
         matched_idx = []
-        rgd = rdRGroupDecomposition.RGroupDecomposition([core], asSmiles=True)
+        params = rdRGroupDecomposition.RGroupDecompositionParameters()
+        params.asSmiles = True
+        rgd = rdRGroupDecomposition.RGroupDecomposition([core], params)
         for i, smi in enumerate(train["smiles"].tolist()):
             mol = Chem.MolFromSmiles(smi)
             if mol is None or not mol.HasSubstructMatch(core):
@@ -776,7 +778,10 @@ def run_rgroup_analysis(
             continue
         try:
             _ = rgd.Process()
-            rows = rgd.GetRGroupsAsRows(asSmiles=True)
+            try:
+                rows = rgd.GetRGroupsAsRows(asSmiles=True)
+            except TypeError:
+                rows = rgd.GetRGroupsAsRows()
             decomposed = len(rows)
         except Exception:
             rows = []
