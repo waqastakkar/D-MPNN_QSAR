@@ -144,19 +144,26 @@ def infer_dmpnn(
     seeds = parse_seeds(args.seeds)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    graphs = []
-    valid_idx = []
-    for idx, row in lib_df.iterrows():
-        smi = row.get(smiles_col, "")
-        g = dmpnn_mod.parse_smiles_to_graph(str(smi), str(row.get(args.id_col, f"row_{idx}")), y_reg=None, y_cls=None)
-        if g is not None:
-            graphs.append(g)
-            valid_idx.append(idx)
-
-    if not graphs:
-        raise RuntimeError("No valid molecules for DMPNN inference.")
-
-    loader = DataLoader(dmpnn_mod.GraphDataset(graphs), batch_size=256, shuffle=False, num_workers=0, collate_fn=dmpnn_mod.collate_graphs)
+    def build_inference_graphs(
+        use_morgan_features: bool,
+        morgan_nbits: int,
+    ) -> Tuple[List[Any], List[int]]:
+        graphs = []
+        valid_idx = []
+        for idx, row in lib_df.iterrows():
+            smi = row.get(smiles_col, "")
+            g = dmpnn_mod.parse_smiles_to_graph(
+                str(smi),
+                str(row.get(args.id_col, f"row_{idx}")),
+                y_reg=None,
+                y_cls=None,
+                use_morgan_features=use_morgan_features,
+                morgan_nbits=morgan_nbits,
+            )
+            if g is not None:
+                graphs.append(g)
+                valid_idx.append(idx)
+        return graphs, valid_idx
 
     all_pred_map: Dict[int, List[float]] = {i: [] for i in lib_df.index}
     n_models = 0
@@ -184,28 +191,43 @@ def infer_dmpnn(
         if tscaler_path.exists():
             target_scaler = json.loads(tscaler_path.read_text(encoding="utf-8"))
 
-        atom_dim = graphs[0].atom_features.shape[1]
-        bond_dim = graphs[0].bond_features.shape[1] if graphs[0].bond_features.size else dmpnn_mod.BOND_FEAT_DIM
-
         for k in range(args.ensemble_size):
             ckpt = seed_dir / "checkpoints" / f"ens_{k}_best_regression.pt"
             if not ckpt.exists():
                 continue
+
+            use_morgan_features = bool(hp.get("use_morgan_features", False))
+            morgan_nbits = int(hp.get("morgan_nbits", 2048))
+            graphs, valid_idx = build_inference_graphs(use_morgan_features=use_morgan_features, morgan_nbits=morgan_nbits)
+            if not graphs:
+                raise RuntimeError("No valid molecules for DMPNN inference.")
+
+            loader = DataLoader(
+                dmpnn_mod.GraphDataset(graphs),
+                batch_size=256,
+                shuffle=False,
+                num_workers=0,
+                collate_fn=dmpnn_mod.collate_graphs,
+            )
+
             model = dmpnn_mod.DMPNNModel(
-                atom_dim=atom_dim,
-                bond_dim=bond_dim,
+                atom_dim=graphs[0].atom_features.shape[1],
+                bond_dim=graphs[0].bond_features.shape[1] if graphs[0].bond_features.size else dmpnn_mod.BOND_FEAT_DIM,
                 hidden_size=int(hp.get("hidden_size", 512)),
                 depth=int(hp.get("depth", 4)),
                 dropout=float(hp.get("dropout", 0.05)),
                 ffn_num_layers=int(hp.get("ffn_num_layers", 2)),
                 ffn_hidden_size=int(hp.get("ffn_hidden_size", 512)),
                 task="regression",
-                use_morgan_features=bool(hp.get("use_morgan_features", False)),
-                morgan_nbits=int(hp.get("morgan_nbits", 2048)),
+                use_morgan_features=use_morgan_features,
+                morgan_nbits=morgan_nbits,
                 morgan_project_dim=int(hp.get("morgan_project_dim", 0)),
             ).to(device)
 
-            obj = torch.load(ckpt, map_location=device)
+            try:
+                obj = torch.load(ckpt, map_location=device, weights_only=True)
+            except TypeError:
+                obj = torch.load(ckpt, map_location=device)
             if "model_state_dict" not in obj:
                 print(f"[WARN] Unexpected checkpoint format: {ckpt}")
                 continue
