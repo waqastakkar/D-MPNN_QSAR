@@ -551,8 +551,14 @@ def main() -> None:
         else:
             ids = np.arange(len(ali))
 
-        smi_baseline_col = "rdkit_canonical_smiles_baseline" if "rdkit_canonical_smiles_baseline" in ali.columns else None
-        smi_dmpnn_col = "rdkit_canonical_smiles_dmpnn" if "rdkit_canonical_smiles_dmpnn" in ali.columns else None
+        def pick_smiles(colset, suffix):
+            for c in [f"smiles_{suffix}", f"rdkit_canonical_smiles_{suffix}", f"canonical_smiles_{suffix}"]:
+                if c in colset:
+                    return c
+            return None
+
+        smi_baseline_col = pick_smiles(set(ali.columns), "baseline")
+        smi_dmpnn_col = pick_smiles(set(ali.columns), "dmpnn")
 
         for model_name, yt_col, yp_col, smi_col in [
             (chosen_baseline, "y_true_baseline", "y_pred_baseline", smi_baseline_col),
@@ -674,7 +680,10 @@ def main() -> None:
             train_smiles = train_df[train_smiles_col].astype(str).tolist()
 
             err_seed = error_df[error_df["seed"] == seed].copy()
-            smiles_for_seed = err_seed[["id", "smiles"]].dropna().drop_duplicates()
+            if "smiles" in err_seed.columns:
+                smiles_for_seed = err_seed[["id", "smiles"]].dropna().drop_duplicates()
+            else:
+                smiles_for_seed = pd.DataFrame(columns=["id", "smiles"])
             if smiles_for_seed.empty:
                 split_seed_test = args.splits_dir / f"seed_{seed}" / "test.csv"
                 if not split_seed_test.exists():
