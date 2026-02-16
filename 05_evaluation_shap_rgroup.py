@@ -753,7 +753,6 @@ def run_rgroup_analysis(
             continue
         matched_idx = []
         params = rdRGroupDecomposition.RGroupDecompositionParameters()
-        params.asSmiles = True
         rgd = rdRGroupDecomposition.RGroupDecomposition([core], params)
         for i, smi in enumerate(train["smiles"].tolist()):
             mol = Chem.MolFromSmiles(smi)
@@ -830,7 +829,12 @@ def run_rgroup_analysis(
             }
             for k, v in rg_row.items():
                 if k.lower().startswith("r"):
-                    row[k] = v if v is not None else ""
+                    if v is None:
+                        row[k] = ""
+                    elif isinstance(v, Chem.Mol):
+                        row[k] = Chem.MolToSmiles(v)
+                    else:
+                        row[k] = str(v)
             rows.append(row)
         rtable = pd.DataFrame(rows)
     else:
