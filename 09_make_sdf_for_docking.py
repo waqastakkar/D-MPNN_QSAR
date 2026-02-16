@@ -104,9 +104,22 @@ def main() -> None:
         params = AllChem.ETKDGv3()
         params.randomSeed = int(args.seed)
         params.pruneRmsThresh = float(args.prune_rms_thresh)
-        params.maxAttempts = int(args.max_attempts)
+        if hasattr(params, "maxAttempts"):
+            params.maxAttempts = int(args.max_attempts)
+        elif hasattr(params, "maxAttemptsPerAtom"):
+            params.maxAttemptsPerAtom = int(args.max_attempts)
 
-        conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(args.n_confs), params=params))
+        try:
+            conf_ids = list(
+                AllChem.EmbedMultipleConfs(
+                    mol,
+                    numConfs=int(args.n_confs),
+                    params=params,
+                    maxAttempts=int(args.max_attempts),
+                )
+            )
+        except TypeError:
+            conf_ids = list(AllChem.EmbedMultipleConfs(mol, numConfs=int(args.n_confs), params=params))
         if not conf_ids:
             failures.append({**row.to_dict(), "reason": "embed_fail"})
             continue
