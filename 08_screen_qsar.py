@@ -128,6 +128,13 @@ def write_manifest(path: Path, args: argparse.Namespace, n_models: int, xgb_foun
         "args": " ".join(sys.argv[1:]),
         "n_dmpnn_models": n_models,
         "xgb_found": xgb_found,
+        "umap_enabled": bool(args.umap),
+        "umap_radius": int(args.umap_radius),
+        "umap_nbits": int(args.umap_nbits),
+        "umap_n_neighbors": int(args.umap_n_neighbors),
+        "umap_min_dist": float(args.umap_min_dist),
+        "umap_metric": str(args.umap_metric),
+        "umap_random_state": int(args.umap_random_state),
     }
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
@@ -370,6 +377,140 @@ def make_plots(scored_df: pd.DataFrame, out_svg_dir: Path, xgb_avail: bool) -> N
     plt.close(fig)
 
 
+def to_canonical_smiles(smiles: str) -> Optional[str]:
+    mol = safe_mol_from_smiles(smiles)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol, canonical=True, isomericSmiles=True)
+
+
+def run_umap_and_make_plots(
+    ranked_df: pd.DataFrame,
+    outdir: Path,
+    args: argparse.Namespace,
+    id_col: str,
+    name_col: str,
+    smiles_col: str,
+) -> None:
+    if not args.umap:
+        print("[INFO] UMAP plotting disabled (--umap).")
+        return
+
+    try:
+        import umap
+    except Exception as exc:
+        raise RuntimeError("UMAP is not installed. Please run: pip install umap-learn") from exc
+
+    work_df = ranked_df.copy()
+    if "canonical_smiles" in work_df.columns:
+        work_df["canonical_smiles"] = work_df["canonical_smiles"].astype(str)
+    else:
+        work_df["canonical_smiles"] = work_df[smiles_col].astype(str)
+
+    work_df["canonical_smiles"] = [to_canonical_smiles(smi) for smi in work_df["canonical_smiles"].astype(str)]
+
+    fp_matrix = np.zeros((len(work_df), args.umap_nbits), dtype=np.float32)
+    for i, smi in enumerate(work_df["canonical_smiles"].astype(str)):
+        fp = morgan_fp(smi, radius=args.umap_radius, nbits=args.umap_nbits, use_chirality=True)
+        if fp is None:
+            continue
+        arr = np.zeros((args.umap_nbits,), dtype=np.int8)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        fp_matrix[i] = arr.astype(np.float32)
+
+    reducer = umap.UMAP(
+        n_neighbors=args.umap_n_neighbors,
+        min_dist=args.umap_min_dist,
+        metric=args.umap_metric,
+        random_state=args.umap_random_state,
+    )
+    embedding = reducer.fit_transform(fp_matrix)
+    work_df["umap1"] = embedding[:, 0]
+    work_df["umap2"] = embedding[:, 1]
+
+    top_ids = set()
+    top_path = outdir / "top_for_docking.csv"
+    if top_path.exists():
+        top_df = pd.read_csv(top_path)
+        if id_col in top_df.columns:
+            top_ids = set(top_df[id_col].astype(str))
+    work_df["is_top_for_docking"] = work_df[id_col].astype(str).isin(top_ids)
+
+    out_cols = [
+        id_col,
+        name_col,
+        "canonical_smiles",
+        "pred_pIC50_dmpnn",
+        "pred_pIC50_xgb",
+        "pred_pIC50_consensus",
+        "nn_similarity",
+        "ad_bucket",
+        "umap1",
+        "umap2",
+    ]
+    out_cols = [c for c in out_cols if c in work_df.columns]
+    work_df[out_cols].to_csv(outdir / "umap_library.csv", index=False)
+
+    plots_data_dir = outdir / "plots_data"
+    plots_data_dir.mkdir(parents=True, exist_ok=True)
+    work_df.to_csv(plots_data_dir / "umap_points.csv", index=False)
+
+    plot_dir = outdir / "plots" / "svg"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+
+    ad_colors = {
+        "in_domain": NATURE["blue"],
+        "novel": NATURE["green"],
+        "out_of_domain": NATURE["orange"],
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for bucket, color in ad_colors.items():
+        sub = work_df[work_df["ad_bucket"] == bucket]
+        ax.scatter(sub["umap1"], sub["umap2"], s=14, alpha=0.85, color=color, label=bucket)
+    ax.set_xlabel("UMAP1")
+    ax.set_ylabel("UMAP2")
+    ax.set_title("UMAP by AD Bucket")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(plot_dir / "umap_ad_bucket.svg", format="svg", bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(work_df["umap1"], work_df["umap2"], c=work_df["nn_similarity"], s=14, alpha=0.9, cmap="viridis")
+    ax.set_xlabel("UMAP1")
+    ax.set_ylabel("UMAP2")
+    ax.set_title("UMAP by NN Similarity")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("nn_similarity")
+    fig.tight_layout()
+    fig.savefig(plot_dir / "umap_similarity.svg", format="svg", bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    sc = ax.scatter(work_df["umap1"], work_df["umap2"], c=work_df["pred_pIC50_dmpnn"], s=14, alpha=0.9, cmap="plasma")
+    ax.set_xlabel("UMAP1")
+    ax.set_ylabel("UMAP2")
+    ax.set_title("UMAP by Predicted pIC50 (DMPNN)")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("pred_pIC50_dmpnn")
+    fig.tight_layout()
+    fig.savefig(plot_dir / "umap_pred_dmpnn.svg", format="svg", bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(work_df["umap1"], work_df["umap2"], s=12, alpha=0.7, color="#BBBBBB", label="library")
+    top_sub = work_df[work_df["is_top_for_docking"]]
+    if not top_sub.empty:
+        ax.scatter(top_sub["umap1"], top_sub["umap2"], s=20, alpha=0.95, color=NATURE["red2"], label="top_for_docking")
+    ax.set_xlabel("UMAP1")
+    ax.set_ylabel("UMAP2")
+    ax.set_title("UMAP Top Hits")
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(plot_dir / "umap_top_hits.svg", format="svg", bbox_inches="tight")
+    plt.close(fig)
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Screen library with trained QSAR models")
     p.add_argument("--library_csv", default="screening/library_clean.csv")
@@ -397,6 +538,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tick_size", type=float, default=14)
     p.add_argument("--legend_size", type=float, default=14)
     p.add_argument("--base_font", type=float, default=14)
+
+    p.add_argument("--umap", action="store_true", default=True)
+    p.add_argument("--umap_radius", type=int, default=2)
+    p.add_argument("--umap_nbits", type=int, default=2048)
+    p.add_argument("--umap_n_neighbors", type=int, default=15)
+    p.add_argument("--umap_min_dist", type=float, default=0.1)
+    p.add_argument("--umap_metric", type=str, default="jaccard")
+    p.add_argument("--umap_random_state", type=int, default=42)
     return p.parse_args()
 
 
@@ -486,6 +635,14 @@ def main() -> None:
     top.to_csv(outdir / "top_for_docking.csv", index=False)
 
     make_plots(scored_df, outdir / "plots" / "svg", xgb_avail)
+    run_umap_and_make_plots(
+        ranked_df=ranked_df,
+        outdir=outdir,
+        args=args,
+        id_col=args.id_col,
+        name_col=args.name_col,
+        smiles_col=smiles_col,
+    )
     write_manifest(outdir / "run_manifest_screen.csv", args, n_models=n_models, xgb_found=xgb_avail)
 
     print(f"[DONE] Wrote: {outdir / 'preds_dmpnn.csv'}")
