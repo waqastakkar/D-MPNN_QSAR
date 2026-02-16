@@ -125,6 +125,7 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--primary_model_source", default="dmpnn", choices=["dmpnn", "baselines"])
     p.add_argument("--primary_model_name", default="auto")
+    p.add_argument("--fallback_train_from_splits", type=str2bool, default=True)
 
     p.add_argument("--title_size", type=int, default=18)
     p.add_argument("--label_size", type=int, default=16)
@@ -456,7 +457,8 @@ def make_y_scramble_plot(
     lr = LinearRegression()
     lr.fit(Xtr, ytr)
     yhat_real = lr.predict(Xte)
-    rmse_real = mean_squared_error(yte, yhat_real, squared=False)
+    mse = mean_squared_error(yte, yhat_real)
+    rmse_real = float(np.sqrt(mse))
 
     rng = np.random.default_rng(2027)
     scramble_rmses = []
@@ -466,7 +468,8 @@ def make_y_scramble_plot(
         m = LinearRegression()
         m.fit(Xtr, ys)
         yhat = m.predict(Xte)
-        scramble_rmses.append(mean_squared_error(yte, yhat, squared=False))
+        mse_scramble = mean_squared_error(yte, yhat)
+        scramble_rmses.append(float(np.sqrt(mse_scramble)))
 
     fig, ax = plt.subplots(figsize=(7, 6))
     ax.boxplot(scramble_rmses, positions=[0], widths=0.5)
@@ -482,6 +485,51 @@ def make_y_scramble_plot(
         None if plots_png is None else plots_png / "paper_y_scramble.png",
     )
 
+
+def build_train_from_splits(
+    splits_dir: Path,
+    seeds: Sequence[int],
+    id_col: str,
+    smiles_col: str,
+    target_col: str,
+) -> pd.DataFrame:
+    """Build fallback train rows from seed train CSV files.
+
+    Notes:
+    - The caller should set/overwrite the `model` column to the chosen primary model.
+    - `y_pred` is set to NaN by design for fallback rows.
+    """
+    rows: List[pd.DataFrame] = []
+    for seed in seeds:
+        train_path = splits_dir / f"seed_{seed}" / "train.csv"
+        if not train_path.exists():
+            continue
+        df = pd.read_csv(train_path)
+        idc = _find_col(df, ["id", "mol_id", "molecule_id", id_col])
+        smc = _find_col(df, ["smiles", "canonical_smiles", smiles_col])
+        ytc = _find_col(df, ["y_true", "true", "target", target_col])
+        if idc is None or smc is None or ytc is None:
+            continue
+        part = pd.DataFrame(
+            {
+                "seed": int(seed),
+                "model": "",
+                "split": "train",
+                "id": df[idc],
+                "smiles": df[smc],
+                "y_true": pd.to_numeric(df[ytc], errors="coerce"),
+                "y_pred": np.nan,
+            }
+        )
+        part = part.dropna(subset=["id", "smiles", "y_true"]).copy()
+        rows.append(part)
+    if not rows:
+        return pd.DataFrame(columns=["seed", "model", "split", "id", "smiles", "y_true", "y_pred"])
+    out = pd.concat(rows, ignore_index=True)
+    out["seed"] = out["seed"].astype(int)
+    out["model"] = out["model"].astype(str)
+    out["split"] = "train"
+    return out
 
 def run_shap_analysis(
     pred_df: pd.DataFrame,
@@ -686,7 +734,8 @@ def run_rgroup_analysis(
     if train.empty:
         print("[WARN] No train rows for R-group analysis.")
         return
-    train["residual"] = train["y_pred"] - train["y_true"]
+    finite_pred = np.isfinite(train["y_pred"].values)
+    train["residual"] = np.where(finite_pred, train["y_pred"] - train["y_true"], np.nan)
     train["scaffold"] = train["smiles"].apply(murcko_smiles)
     train = train[train["scaffold"] != ""].copy()
     if train.empty:
@@ -819,7 +868,8 @@ def run_rgroup_analysis(
         return
 
     core_mean_true = float(rtable["y_true"].mean())
-    core_mean_pred = float(rtable["y_pred"].mean())
+    finite_pred_n = int(np.isfinite(rtable["y_pred"].values).sum())
+    core_mean_pred = float(rtable["y_pred"].mean()) if finite_pred_n >= 10 else np.nan
 
     stats_rows = []
     for (pos, sub), g in long.groupby(["rgroup_position", "substituent"]):
@@ -836,7 +886,7 @@ def run_rgroup_analysis(
                 "std_y_pred": g["y_pred"].std(ddof=1),
                 "mean_residual": g["residual"].mean(),
                 "enrichment": g["y_true"].mean() - core_mean_true,
-                "pred_shift": g["y_pred"].mean() - core_mean_pred,
+                "pred_shift": (g["y_pred"].mean() - core_mean_pred) if finite_pred_n >= 10 else np.nan,
             }
         )
     stats_df = pd.DataFrame(stats_rows)
@@ -868,12 +918,15 @@ def run_rgroup_analysis(
     show = top_eff.head(top_k_rgroups).iloc[::-1]
     lab = [f"{r.rgroup_position}:{str(r.substituent)[:18]}" for r in show.itertuples()]
     ax.barh(np.arange(len(show)), show["enrichment"], color=NATURE_PALETTE["green"], alpha=0.8, label="mean_y_true shift")
-    ax.barh(np.arange(len(show)), show["pred_shift"], color=NATURE_PALETTE["purple"], alpha=0.5, label="mean_y_pred shift")
+    has_pred_shift = np.isfinite(show["pred_shift"].values).any()
+    if has_pred_shift:
+        ax.barh(np.arange(len(show)), show["pred_shift"], color=NATURE_PALETTE["purple"], alpha=0.5, label="mean_y_pred shift")
     ax.set_yticks(np.arange(len(show)))
     ax.set_yticklabels(lab, fontweight="bold")
     ax.set_xlabel("Shift vs core mean")
     ax.set_title("Top R-group effects")
-    ax.legend()
+    if has_pred_shift:
+        ax.legend()
     save_fig(
         fig,
         plots_svg / "rgroup_effects_top.svg",
@@ -955,7 +1008,9 @@ def run_mmpa_analysis(
                     "scaffold": scaf,
                     "transform_smarts": f"{r1['sub_sig']}>>{r2['sub_sig']}",
                     "delta_pIC50": float(r2["y_true"] - r1["y_true"]),
-                    "delta_pred": float(r2["y_pred"] - r1["y_pred"]),
+                    "delta_pred": float(r2["y_pred"] - r1["y_pred"])
+                    if np.isfinite(r1["y_pred"]) and np.isfinite(r2["y_pred"])
+                    else np.nan,
                     "seed": int(seed),
                 }
             )
@@ -1244,19 +1299,40 @@ def main() -> None:
 
     print(f"[INFO] Primary model selected: {primary.source}:{primary.model_name}")
 
+    pred_for_analysis = pred.copy()
+    if args.fallback_train_from_splits:
+        existing_train = pred_for_analysis[
+            (pred_for_analysis["model"] == primary.model_name) & (pred_for_analysis["split"] == "train")
+        ]
+        have_seeds = set(existing_train["seed"].astype(int).tolist())
+        missing_seeds = [s for s in seeds if s not in have_seeds]
+        if missing_seeds:
+            fallback_train = build_train_from_splits(
+                splits_dir=Path(args.splits_dir),
+                seeds=missing_seeds,
+                id_col=args.id_col,
+                smiles_col=args.smiles_col,
+                target_col=args.target_col,
+            )
+            if not fallback_train.empty:
+                fallback_train["model"] = primary.model_name
+                pred_for_analysis = pd.concat([pred_for_analysis, fallback_train], ignore_index=True)
+                print(f"[INFO] Added fallback train rows from splits for seeds: {missing_seeds}")
+        pred_for_analysis.to_csv(outdir / "pred_with_fallback_train.csv", index=False)
+
     print("[INFO] Generating core figures...")
     make_model_rmse_plot(cmp_test, plots_svg, plots_png)
-    test_df = pred[pred["split"] == "test"].copy()
+    test_df = pred_for_analysis[pred_for_analysis["split"] == "test"].copy()
     make_parity_plot(test_df, primary.model_name, plots_svg, plots_png)
     make_residuals_plot(test_df, primary.model_name, plots_svg, plots_png)
 
     ad_dir = outdir / "applicability_domain"
     ensure_dirs(ad_dir)
-    ad_df = compute_applicability_domain(pred, primary.model_name, seeds, ad_dir / "error_similarity_table.csv")
+    ad_df = compute_applicability_domain(pred_for_analysis, primary.model_name, seeds, ad_dir / "error_similarity_table.csv")
     make_error_similarity_plot(ad_df, plots_svg, plots_png)
 
     if seeds:
-        make_y_scramble_plot(pred, primary.model_name, seeds[0], plots_svg, plots_png)
+        make_y_scramble_plot(pred_for_analysis, primary.model_name, seeds[0], plots_svg, plots_png)
 
     if args.run_shap:
         print("[INFO] Running SHAP analysis...")
@@ -1274,7 +1350,7 @@ def main() -> None:
     if args.run_rgroup:
         print("[INFO] Running R-group/substituent analysis...")
         run_rgroup_analysis(
-            pred_df=pred,
+            pred_df=pred_for_analysis,
             primary_model=primary.model_name,
             seeds=seeds,
             outdir=outdir,
@@ -1287,7 +1363,7 @@ def main() -> None:
 
     if args.run_mmpa:
         print("[INFO] Running MMPA analysis...")
-        run_mmpa_analysis(pred, primary.model_name, outdir, plots_svg, plots_png)
+        run_mmpa_analysis(pred_for_analysis, primary.model_name, outdir, plots_svg, plots_png)
 
     key_files = [
         baselines_pred_path,
