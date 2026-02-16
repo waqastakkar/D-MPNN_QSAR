@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import rdchem
+from rdkit.Chem import AllChem, rdchem
 
 try:
     import torch
@@ -65,6 +65,7 @@ class GraphDatum:
     edge_index: np.ndarray
     bond_features: np.ndarray
     rev_edge_index: np.ndarray
+    morgan_bits: Optional[np.ndarray]
     y_reg: Optional[float]
     y_cls: Optional[float]
 
@@ -133,7 +134,16 @@ def bond_feature(bond: rdchem.Bond) -> np.ndarray:
     return np.asarray(feats, dtype=np.float32)
 
 
-def parse_smiles_to_graph(smiles: str, mol_id: str, y_reg: Optional[float], y_cls: Optional[float]) -> Optional[GraphDatum]:
+def parse_smiles_to_graph(
+    smiles: str,
+    mol_id: str,
+    y_reg: Optional[float],
+    y_cls: Optional[float],
+    use_morgan_features: bool = False,
+    morgan_radius: int = 2,
+    morgan_nbits: int = 2048,
+    morgan_use_chirality: bool = True,
+) -> Optional[GraphDatum]:
     """Convert one SMILES to directed graph representation."""
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
@@ -164,6 +174,12 @@ def parse_smiles_to_graph(smiles: str, mol_id: str, y_reg: Optional[float], y_cl
         bond_feats = np.vstack(e_feats).astype(np.float32)
         rev = np.asarray([pair_to_eidx[(v, u)] for u, v in edges], dtype=np.int64)
 
+    morgan_bits: Optional[np.ndarray] = None
+    if use_morgan_features:
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, morgan_radius, nBits=morgan_nbits, useChirality=morgan_use_chirality)
+        morgan_bits = np.zeros((morgan_nbits,), dtype=np.float32)
+        morgan_bits[np.asarray(list(fp.GetOnBits()), dtype=np.int64)] = 1.0
+
     return GraphDatum(
         smiles=smiles,
         mol_id=mol_id,
@@ -171,6 +187,7 @@ def parse_smiles_to_graph(smiles: str, mol_id: str, y_reg: Optional[float], y_cl
         edge_index=edge_index,
         bond_features=bond_feats,
         rev_edge_index=rev,
+        morgan_bits=morgan_bits,
         y_reg=y_reg,
         y_cls=y_cls,
     )
@@ -185,6 +202,7 @@ def collate_graphs(items: Sequence[GraphDatum]) -> Dict[str, Any]:
 
     y_reg: List[float] = []
     y_cls: List[float] = []
+    morgan_parts: List[np.ndarray] = []
     ids: List[str] = []
     smiles: List[str] = []
 
@@ -211,6 +229,8 @@ def collate_graphs(items: Sequence[GraphDatum]) -> Dict[str, Any]:
 
         y_reg.append(np.nan if g.y_reg is None else float(g.y_reg))
         y_cls.append(np.nan if g.y_cls is None else float(g.y_cls))
+        if g.morgan_bits is not None:
+            morgan_parts.append(g.morgan_bits)
         ids.append(g.mol_id)
         smiles.append(g.smiles)
 
@@ -224,7 +244,7 @@ def collate_graphs(items: Sequence[GraphDatum]) -> Dict[str, Any]:
         bond_f = torch.zeros((0, BOND_FEAT_DIM), dtype=torch.float32)
         rev_edge = torch.zeros((0,), dtype=torch.long)
 
-    return {
+    out = {
         "atom_features": atom_f.float(),
         "edge_index": edge_index,
         "bond_features": bond_f,
@@ -236,6 +256,9 @@ def collate_graphs(items: Sequence[GraphDatum]) -> Dict[str, Any]:
         "ids": ids,
         "smiles": smiles,
     }
+    if len(morgan_parts) == len(items) and len(morgan_parts) > 0:
+        out["morgan_features"] = torch.from_numpy(np.vstack(morgan_parts)).float()
+    return out
 
 
 class DMPNNModel(nn.Module):
@@ -251,18 +274,29 @@ class DMPNNModel(nn.Module):
         ffn_num_layers: int,
         ffn_hidden_size: int,
         task: str,
+        use_morgan_features: bool = False,
+        morgan_nbits: int = 2048,
+        morgan_project_dim: int = 0,
     ) -> None:
         super().__init__()
         self.task = task
         self.depth = max(1, depth)
         self.dropout = nn.Dropout(dropout)
+        self.use_morgan_features = bool(use_morgan_features)
+        self.morgan_project_dim = int(max(0, morgan_project_dim))
 
         self.W_i = nn.Linear(atom_dim + bond_dim, hidden_size)
         self.W_m = nn.Linear(hidden_size, hidden_size)
         self.W_a = nn.Linear(atom_dim + hidden_size, hidden_size)
 
+        if self.use_morgan_features and self.morgan_project_dim > 0:
+            self.morgan_project = nn.Linear(morgan_nbits, self.morgan_project_dim)
+        else:
+            self.morgan_project = None
+
         head_layers: List[nn.Module] = []
-        in_dim = hidden_size
+        morgan_dim = self.morgan_project_dim if self.morgan_project is not None else (morgan_nbits if self.use_morgan_features else 0)
+        in_dim = hidden_size + morgan_dim
         for _ in range(max(1, ffn_num_layers) - 1):
             head_layers.extend([nn.Linear(in_dim, ffn_hidden_size), nn.ReLU(), nn.Dropout(dropout)])
             in_dim = ffn_hidden_size
@@ -304,10 +338,15 @@ class DMPNNModel(nn.Module):
                 mol_vecs.append(torch.zeros((atom_state.shape[1],), device=atom_state.device))
             else:
                 mol_vecs.append(atom_state[start : start + length].mean(dim=0))
-        mol_emb = torch.stack(mol_vecs, dim=0)
-        pred = self.head(self.dropout(mol_emb)).squeeze(1)
+        h_gnn = torch.stack(mol_vecs, dim=0)
+        h = h_gnn
+        if self.use_morgan_features:
+            morgan_f = batch["morgan_features"]
+            h_morgan = self.morgan_project(morgan_f) if self.morgan_project is not None else morgan_f
+            h = torch.cat([h_gnn, h_morgan], dim=1)
+        pred = self.head(self.dropout(h)).squeeze(1)
         if return_embeddings:
-            return pred, mol_emb
+            return pred, h
         return pred
 
 
@@ -609,7 +648,19 @@ def make_datasets_for_seed(
                 if math.isnan(y_cls):
                     invalid_rows.append({"split": split_name, "row_index": int(i), "id": mol_id, "smiles": smi, "reason": "invalid_classification_label"})
                     continue
-            g = parse_smiles_to_graph(smi, mol_id, y_reg, y_cls)
+            if getattr(args, "use_morgan_features_effective", args.use_morgan_features):
+                g = parse_smiles_to_graph(
+                    smi,
+                    mol_id,
+                    y_reg,
+                    y_cls,
+                    use_morgan_features=True,
+                    morgan_radius=args.morgan_radius,
+                    morgan_nbits=args.morgan_nbits,
+                    morgan_use_chirality=args.morgan_use_chirality,
+                )
+            else:
+                g = parse_smiles_to_graph(smi, mol_id, y_reg, y_cls)
             if g is None:
                 invalid_rows.append({"split": split_name, "row_index": int(i), "id": mol_id, "smiles": smi, "reason": "rdkit_parse_failed"})
                 continue
@@ -720,7 +771,19 @@ def train_torch_task(
     atom_dim = train_items[0].atom_features.shape[1]
     bond_dim = train_items[0].bond_features.shape[1] if train_items[0].bond_features.size else BOND_FEAT_DIM
 
-    model = DMPNNModel(atom_dim, bond_dim, args.hidden_size, args.depth, args.dropout, args.ffn_num_layers, args.ffn_hidden_size, task).to(device)
+    model = DMPNNModel(
+        atom_dim,
+        bond_dim,
+        args.hidden_size,
+        args.depth,
+        args.dropout,
+        args.ffn_num_layers,
+        args.ffn_hidden_size,
+        task,
+        use_morgan_features=getattr(args, "use_morgan_features_effective", args.use_morgan_features),
+        morgan_nbits=args.morgan_nbits,
+        morgan_project_dim=args.morgan_project_dim,
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min" if task == "regression" else "max", patience=5, factor=0.7)
 
@@ -1059,6 +1122,11 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--amp", action="store_true", default=False)
     p.add_argument("--save_attention", action="store_true", default=False)
     p.add_argument("--export_embeddings", action="store_true", default=False)
+    p.add_argument("--use_morgan_features", action="store_true", default=False)
+    p.add_argument("--morgan_radius", type=int, default=2)
+    p.add_argument("--morgan_nbits", type=int, default=2048)
+    p.add_argument("--morgan_use_chirality", action="store_true", default=True)
+    p.add_argument("--morgan_project_dim", type=int, default=0)
 
     p.add_argument("--title_size", type=int, default=18)
     p.add_argument("--label_size", type=int, default=16)
@@ -1081,6 +1149,11 @@ def main() -> None:
     backend = "chemprop" if has_chemprop() else "torch_fallback"
     print(f"[INFO] Selected backend: {backend}")
     print(f"[INFO] Device: {device}")
+
+    requested_use_morgan_features = bool(args.use_morgan_features)
+    args.use_morgan_features_effective = bool(requested_use_morgan_features and backend == "torch_fallback")
+    if requested_use_morgan_features and backend == "chemprop":
+        print("[INFO] Morgan features requested but ignored for chemprop backend.")
 
     tasks = ["regression", "classification"] if args.task == "both" else [args.task]
     if args.metric_for_early_stop is None:
@@ -1153,6 +1226,15 @@ def main() -> None:
             "ensemble_size": args.ensemble_size if backend == "torch_fallback" else 1,
             "ensemble_mode": args.ensemble_mode,
             "target_standardize": bool(args.target_standardize),
+            "use_morgan_features": (
+                bool(args.use_morgan_features_effective)
+                if backend == "torch_fallback"
+                else "not_supported_in_chemprop_backend"
+            ),
+            "morgan_radius": args.morgan_radius,
+            "morgan_nbits": args.morgan_nbits,
+            "morgan_use_chirality": bool(args.morgan_use_chirality),
+            "morgan_project_dim": args.morgan_project_dim,
         }
         with (seed_dir / "hyperparams.json").open("w", encoding="utf-8") as f:
             json.dump(to_jsonable(hyperparams), f, indent=2)
@@ -1305,6 +1387,15 @@ def main() -> None:
                 "test_sha256": sha256_file(test_csv),
                 "deterministic_cudnn": bool(device.type == "cuda"),
                 "cudnn_benchmark": False if device.type == "cuda" else "na",
+                "use_morgan_features": (
+                    bool(args.use_morgan_features_effective)
+                    if backend == "torch_fallback"
+                    else "not_supported_in_chemprop_backend"
+                ),
+                "morgan_radius": args.morgan_radius,
+                "morgan_nbits": args.morgan_nbits,
+                "morgan_use_chirality": bool(args.morgan_use_chirality),
+                "morgan_project_dim": args.morgan_project_dim,
             }
         )
 
