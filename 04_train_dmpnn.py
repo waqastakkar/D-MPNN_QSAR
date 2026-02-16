@@ -649,6 +649,7 @@ def predict_torch(
     device: torch.device,
     task: str,
     export_embeddings: bool = False,
+    target_scaler: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     model.eval()
     ys: List[float] = []
@@ -669,6 +670,8 @@ def predict_torch(
             if task == "regression":
                 y = batch_t["y_reg"].detach().cpu().numpy()
                 p = out.detach().cpu().numpy()
+                if target_scaler is not None:
+                    p = p * target_scaler["std"] + target_scaler["mean"]
                 ys.extend(y.tolist())
                 preds.extend(p.tolist())
             else:
@@ -697,16 +700,18 @@ def train_torch_task(
     task: str,
     args: argparse.Namespace,
     seed: int,
+    ensemble_id: int,
     seed_dir: Path,
     train_items: List[GraphDatum],
     val_items: List[GraphDatum],
     test_items: List[GraphDatum],
     device: torch.device,
+    target_scaler: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    """Train torch fallback model for one task and one seed."""
+    """Train torch fallback model for one task/seed/ensemble member."""
     ckpt_dir = seed_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    best_ckpt = ckpt_dir / ("best_regression.pt" if task == "regression" else "best_classification.pt")
+    best_ckpt = ckpt_dir / (f"ens_{ensemble_id}_best_regression.pt" if task == "regression" else f"ens_{ensemble_id}_best_classification.pt")
 
     train_loader = DataLoader(GraphDataset(train_items), batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers, collate_fn=collate_graphs)
     val_loader = DataLoader(GraphDataset(val_items), batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, collate_fn=collate_graphs)
@@ -721,7 +726,6 @@ def train_torch_task(
 
     criterion: nn.Module = nn.MSELoss() if task == "regression" else nn.BCEWithLogitsLoss()
     stopper = EarlyStopper(args.early_stopping_patience, mode="min" if task == "regression" else "max")
-
     scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp and device.type == "cuda"))
 
     history: List[Dict[str, Any]] = []
@@ -736,13 +740,15 @@ def train_torch_task(
             with torch.cuda.amp.autocast(enabled=bool(args.amp and device.type == "cuda")):
                 out = model(batch_t)
                 target = batch_t["y_reg"] if task == "regression" else batch_t["y_cls"]
+                if task == "regression" and target_scaler is not None:
+                    target = (target - target_scaler["mean"]) / target_scaler["std"]
                 loss = criterion(out, target)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
             train_losses.append(float(loss.detach().cpu()))
 
-        val_pred = predict_torch(model, val_loader, device, task)
+        val_pred = predict_torch(model, val_loader, device, task, target_scaler=target_scaler)
         val_true = val_pred["y_true"]
         if task == "regression":
             vm = evaluate_regression(val_true, val_pred["y_pred"])
@@ -750,6 +756,7 @@ def train_torch_task(
             scheduler.step(monitor)
             row = {
                 "epoch": epoch,
+                "ensemble_id": ensemble_id,
                 "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
                 "val_rmse": vm["rmse"],
                 "val_mae": vm["mae"],
@@ -763,6 +770,7 @@ def train_torch_task(
             scheduler.step(monitor if not math.isnan(monitor) else 0.0)
             row = {
                 "epoch": epoch,
+                "ensemble_id": ensemble_id,
                 "train_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
                 "val_roc_auc": vm["roc_auc"],
                 "val_pr_auc": vm["pr_auc"],
@@ -783,8 +791,9 @@ def train_torch_task(
     model.load_state_dict(best_obj["model_state_dict"])
 
     pred_start = time.time()
-    val_out = predict_torch(model, val_loader, device, task, export_embeddings=args.export_embeddings)
-    test_out = predict_torch(model, test_loader, device, task, export_embeddings=args.export_embeddings)
+    train_out = predict_torch(model, train_loader, device, task, export_embeddings=False, target_scaler=target_scaler)
+    val_out = predict_torch(model, val_loader, device, task, export_embeddings=args.export_embeddings, target_scaler=target_scaler)
+    test_out = predict_torch(model, test_loader, device, task, export_embeddings=args.export_embeddings, target_scaler=target_scaler)
     pred_time = time.time() - pred_start
 
     if task == "regression":
@@ -796,6 +805,7 @@ def train_torch_task(
 
     return {
         "history": pd.DataFrame(history),
+        "train_pred": train_out,
         "val_pred": val_out,
         "test_pred": test_out,
         "val_metrics": val_metrics,
@@ -845,6 +855,8 @@ def make_plots(args: argparse.Namespace, outdir: Path, seeds: List[int], task_mo
         all_pred_path = outdir / "all_predictions_regression.csv"
         if all_pred_path.exists():
             ap = pd.read_csv(all_pred_path)
+            if "ensemble_id" in ap.columns:
+                ap = ap[ap["ensemble_id"].astype(str) == "ens"].copy()
             test_df = ap[ap["split"] == "test"].copy()
             if not test_df.empty:
                 fig, ax = plt.subplots(figsize=(6, 6))
@@ -901,6 +913,8 @@ def make_plots(args: argparse.Namespace, outdir: Path, seeds: List[int], task_mo
         if by_seed.exists() and all_pred.exists():
             ms = pd.read_csv(by_seed)
             tp = pd.read_csv(all_pred)
+            if "ensemble_id" in tp.columns:
+                tp = tp[tp["ensemble_id"].astype(str) == "ens"].copy()
             test_ms = ms[ms["split"] == "test"].copy()
             if not test_ms.empty:
                 best = test_ms.sort_values(["roc_auc", "pr_auc"], ascending=[False, False]).iloc[0]
@@ -944,6 +958,64 @@ def make_plots(args: argparse.Namespace, outdir: Path, seeds: List[int], task_mo
                     maybe_save(fig, svg_dir / "confusion_matrix_test_best_seed.svg", (png_dir / "confusion_matrix_test_best_seed.png") if args.png else None, args)
 
 
+def prediction_dict_to_rows(task: str, seed: int, ensemble_id: Any, model_name: str, split: str, pred: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    n = len(pred["ids"])
+    for i in range(n):
+        row: Dict[str, Any] = {
+            "seed": seed,
+            "ensemble_id": ensemble_id,
+            "model_name": model_name,
+            "split": split,
+            "id": pred["ids"][i],
+            "smiles": pred["smiles"][i],
+            "y_true": pred["y_true"][i],
+        }
+        if task == "regression":
+            row["y_pred"] = pred["y_pred"][i]
+        else:
+            row["y_logit"] = pred["y_logit"][i]
+            row["y_proba"] = pred["y_proba"][i]
+            row["y_pred_label"] = pred["y_pred_label"][i]
+        rows.append(row)
+    return rows
+
+
+def aggregate_predictions(pred_df: pd.DataFrame, task: str, mode: str) -> pd.DataFrame:
+    value_col = "y_pred" if task == "regression" else "y_proba"
+    agg_fn = np.mean if mode == "mean" else np.median
+    key_cols = ["seed", "split", "id", "smiles"]
+
+    grouped = pred_df.groupby(key_cols, sort=False)
+    out = grouped.agg(y_true=("y_true", "first"), y_agg=(value_col, agg_fn)).reset_index()
+    out["ensemble_id"] = "ens"
+    out["model_name"] = "dmpnn_ens"
+    if task == "regression":
+        out = out.rename(columns={"y_agg": "y_pred"})
+    else:
+        out = out.rename(columns={"y_agg": "y_proba"})
+        out["y_proba"] = out["y_proba"].astype(float)
+        out["y_logit"] = np.log(np.clip(out["y_proba"], 1e-7, 1 - 1e-7) / np.clip(1 - out["y_proba"], 1e-7, 1 - 1e-7))
+        out["y_pred_label"] = (out["y_proba"] >= 0.5).astype(int)
+    return out
+
+
+def evaluate_ensemble_metrics(pred_df: pd.DataFrame, task: str, seed: int) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    for split in ["val", "test"]:
+        sdf = pred_df[pred_df["split"] == split]
+        if sdf.empty:
+            continue
+        y_true = sdf["y_true"].to_numpy(dtype=float)
+        if task == "regression":
+            y_pred = sdf["y_pred"].to_numpy(dtype=float)
+            rows.append({"model_name": "dmpnn_ens", "split": split, **evaluate_regression(y_true, y_pred), "seed": seed})
+        else:
+            y_prob = sdf["y_proba"].to_numpy(dtype=float)
+            rows.append({"model_name": "dmpnn_ens", "split": split, **evaluate_classification(y_true, y_prob), "seed": seed})
+    return pd.DataFrame(rows)
+
+
 def to_jsonable(d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for k, v in d.items():
@@ -966,17 +1038,20 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--target_col", default="pIC50")
     p.add_argument("--label_col", default="Active")
 
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--epochs", type=int, default=400)
     p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=1e-6)
-    p.add_argument("--hidden_size", type=int, default=300)
-    p.add_argument("--depth", type=int, default=3)
-    p.add_argument("--dropout", type=float, default=0.1)
+    p.add_argument("--hidden_size", type=int, default=512)
+    p.add_argument("--depth", type=int, default=4)
+    p.add_argument("--dropout", type=float, default=0.05)
     p.add_argument("--ffn_num_layers", type=int, default=2)
-    p.add_argument("--ffn_hidden_size", type=int, default=300)
+    p.add_argument("--ffn_hidden_size", type=int, default=512)
     p.add_argument("--message_passing", default="directed")
-    p.add_argument("--early_stopping_patience", type=int, default=20)
+    p.add_argument("--early_stopping_patience", type=int, default=50)
+    p.add_argument("--ensemble_size", type=int, default=5)
+    p.add_argument("--ensemble_mode", choices=["mean", "median"], default="mean")
+    p.add_argument("--target_standardize", action="store_true", default=True)
     p.add_argument("--metric_for_early_stop", default=None)
 
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
@@ -1039,19 +1114,20 @@ def main() -> None:
         ensure_columns(val_df, [args.smiles_col], val_csv)
         ensure_columns(test_df, [args.smiles_col], test_csv)
 
-        if "regression" in tasks:
+        seed_tasks = list(tasks)
+        if "regression" in seed_tasks:
             ensure_columns(train_df, [args.target_col], train_csv)
             ensure_columns(val_df, [args.target_col], val_csv)
             ensure_columns(test_df, [args.target_col], test_csv)
-        if "classification" in tasks:
+        if "classification" in seed_tasks:
             if args.label_col not in train_df.columns:
                 print(f"[WARN] Label column {args.label_col} not found in train split for seed {seed}; skipping classification.")
-                tasks = [t for t in tasks if t != "classification"]
+                seed_tasks = [t for t in seed_tasks if t != "classification"]
             else:
                 cls_values = pd.concat([train_df[args.label_col], val_df[args.label_col], test_df[args.label_col]], axis=0).dropna().unique()
                 if len(np.unique(cls_values)) < 2:
                     print(f"[WARN] Only one class present for seed {seed}; skipping classification.")
-                    tasks = [t for t in tasks if t != "classification"]
+                    seed_tasks = [t for t in seed_tasks if t != "classification"]
 
         use_cuda = device.type == "cuda"
         set_global_seed(seed, use_cuda=use_cuda)
@@ -1074,6 +1150,9 @@ def main() -> None:
             "ffn_hidden_size": args.ffn_hidden_size,
             "early_stopping_patience": args.early_stopping_patience,
             "message_passing": args.message_passing,
+            "ensemble_size": args.ensemble_size if backend == "torch_fallback" else 1,
+            "ensemble_mode": args.ensemble_mode,
+            "target_standardize": bool(args.target_standardize),
         }
         with (seed_dir / "hyperparams.json").open("w", encoding="utf-8") as f:
             json.dump(to_jsonable(hyperparams), f, indent=2)
@@ -1081,146 +1160,125 @@ def main() -> None:
         seed_train_time = 0.0
         seed_predict_time = 0.0
 
-        for task in list(tasks):
+        for task in list(seed_tasks):
             print(f"[INFO] Seed {seed} task={task} training started")
             task_backend = backend
-            result: Dict[str, Any]
-            if backend == "chemprop":
-                try:
-                    ckpt = seed_dir / "checkpoints" / ("best_regression.pt" if task == "regression" else "best_classification.pt")
-                    tr_pred, v_pred, te_pred = run_chemprop_train_predict(args, task, seed_dir, train_csv, val_csv, test_csv, ckpt)
-                    # Minimal compatibility wrapper; metrics/predictions built from original split order.
-                    result = {
-                        "history": pd.DataFrame(),
-                        "train_time_sec": float("nan"),
-                        "predict_time_sec": float("nan"),
-                    }
-                    if task == "regression":
-                        pred_col = v_pred.columns[-1]
-                        val_true = val_df[args.target_col].to_numpy(dtype=float)
-                        test_true = test_df[args.target_col].to_numpy(dtype=float)
-                        val_pred = v_pred[pred_col].to_numpy(dtype=float)
-                        test_pred = te_pred[te_pred.columns[-1]].to_numpy(dtype=float)
-                        result["val_pred"] = {"ids": val_df.get(args.id_col, pd.Series(np.arange(len(val_df)))).astype(str).tolist(), "smiles": val_df[args.smiles_col].astype(str).tolist(), "y_true": val_true, "y_pred": val_pred}
-                        result["test_pred"] = {"ids": test_df.get(args.id_col, pd.Series(np.arange(len(test_df)))).astype(str).tolist(), "smiles": test_df[args.smiles_col].astype(str).tolist(), "y_true": test_true, "y_pred": test_pred}
-                        result["val_metrics"] = evaluate_regression(val_true, val_pred)
-                        result["test_metrics"] = evaluate_regression(test_true, test_pred)
-                    else:
-                        pred_col = v_pred.columns[-1]
-                        val_true = val_df[args.label_col].to_numpy(dtype=float)
-                        test_true = test_df[args.label_col].to_numpy(dtype=float)
-                        val_prob = v_pred[pred_col].to_numpy(dtype=float)
-                        test_prob = te_pred[te_pred.columns[-1]].to_numpy(dtype=float)
-                        result["val_pred"] = {
-                            "ids": val_df.get(args.id_col, pd.Series(np.arange(len(val_df)))).astype(str).tolist(),
-                            "smiles": val_df[args.smiles_col].astype(str).tolist(),
-                            "y_true": val_true,
-                            "y_logit": np.log(np.clip(val_prob, 1e-7, 1 - 1e-7) / np.clip(1 - val_prob, 1e-7, 1 - 1e-7)),
-                            "y_proba": val_prob,
-                            "y_pred_label": (val_prob >= 0.5).astype(int),
-                        }
-                        result["test_pred"] = {
-                            "ids": test_df.get(args.id_col, pd.Series(np.arange(len(test_df)))).astype(str).tolist(),
-                            "smiles": test_df[args.smiles_col].astype(str).tolist(),
-                            "y_true": test_true,
-                            "y_logit": np.log(np.clip(test_prob, 1e-7, 1 - 1e-7) / np.clip(1 - test_prob, 1e-7, 1 - 1e-7)),
-                            "y_proba": test_prob,
-                            "y_pred_label": (test_prob >= 0.5).astype(int),
-                        }
-                        result["val_metrics"] = evaluate_classification(val_true, val_prob)
-                        result["test_metrics"] = evaluate_classification(test_true, test_prob)
-                    print(f"[INFO] Seed {seed} task={task}: chemprop run complete")
-                except Exception as exc:
-                    print(f"[WARN] Chemprop backend failed for seed {seed} task={task}: {exc}\n[WARN] Falling back to torch_fallback.")
-                    task_backend = "torch_fallback"
-                    result = train_torch_task(task, args, seed, seed_dir, train_items, val_items, test_items, device)
-            else:
-                result = train_torch_task(task, args, seed, seed_dir, train_items, val_items, test_items, device)
+            ens_size = args.ensemble_size if backend == "torch_fallback" else 1
 
-            seed_train_time += safe_float(result.get("train_time_sec", 0.0))
-            seed_predict_time += safe_float(result.get("predict_time_sec", 0.0))
+            target_scaler: Optional[Dict[str, float]] = None
+            if task == "regression" and backend == "torch_fallback" and args.target_standardize:
+                y_train = np.asarray([x.y_reg for x in train_items if x.y_reg is not None], dtype=float)
+                scaler_std = float(np.std(y_train))
+                if scaler_std <= 0:
+                    scaler_std = 1.0
+                target_scaler = {"mean": float(np.mean(y_train)), "std": scaler_std}
+                with (seed_dir / "target_scaler.json").open("w", encoding="utf-8") as f:
+                    json.dump(target_scaler, f, indent=2)
+
+            member_results: List[Dict[str, Any]] = []
+            for ensemble_id in range(ens_size):
+                internal_seed = seed * 1000 + ensemble_id
+                set_global_seed(internal_seed, use_cuda=use_cuda)
+                if backend == "chemprop":
+                    try:
+                        ckpt = seed_dir / "checkpoints" / (f"ens_{ensemble_id}_best_regression.pt" if task == "regression" else f"ens_{ensemble_id}_best_classification.pt")
+                        tr_pred, v_pred, te_pred = run_chemprop_train_predict(args, task, seed_dir, train_csv, val_csv, test_csv, ckpt)
+                        result: Dict[str, Any] = {"history": pd.DataFrame(), "train_time_sec": float("nan"), "predict_time_sec": float("nan")}
+                        if task == "regression":
+                            pred_col = tr_pred.columns[-1]
+                            result["train_pred"] = {"ids": train_df.get(args.id_col, pd.Series(np.arange(len(train_df)))).astype(str).tolist(), "smiles": train_df[args.smiles_col].astype(str).tolist(), "y_true": train_df[args.target_col].to_numpy(dtype=float), "y_pred": tr_pred[pred_col].to_numpy(dtype=float)}
+                            result["val_pred"] = {"ids": val_df.get(args.id_col, pd.Series(np.arange(len(val_df)))).astype(str).tolist(), "smiles": val_df[args.smiles_col].astype(str).tolist(), "y_true": val_df[args.target_col].to_numpy(dtype=float), "y_pred": v_pred[v_pred.columns[-1]].to_numpy(dtype=float)}
+                            result["test_pred"] = {"ids": test_df.get(args.id_col, pd.Series(np.arange(len(test_df)))).astype(str).tolist(), "smiles": test_df[args.smiles_col].astype(str).tolist(), "y_true": test_df[args.target_col].to_numpy(dtype=float), "y_pred": te_pred[te_pred.columns[-1]].to_numpy(dtype=float)}
+                            result["val_metrics"] = evaluate_regression(result["val_pred"]["y_true"], result["val_pred"]["y_pred"])
+                            result["test_metrics"] = evaluate_regression(result["test_pred"]["y_true"], result["test_pred"]["y_pred"])
+                        else:
+                            pred_col = tr_pred.columns[-1]
+                            tr_prob = tr_pred[pred_col].to_numpy(dtype=float)
+                            va_prob = v_pred[v_pred.columns[-1]].to_numpy(dtype=float)
+                            te_prob = te_pred[te_pred.columns[-1]].to_numpy(dtype=float)
+                            result["train_pred"] = {"ids": train_df.get(args.id_col, pd.Series(np.arange(len(train_df)))).astype(str).tolist(), "smiles": train_df[args.smiles_col].astype(str).tolist(), "y_true": train_df[args.label_col].to_numpy(dtype=float), "y_logit": np.log(np.clip(tr_prob, 1e-7, 1 - 1e-7) / np.clip(1 - tr_prob, 1e-7, 1 - 1e-7)), "y_proba": tr_prob, "y_pred_label": (tr_prob >= 0.5).astype(int)}
+                            result["val_pred"] = {"ids": val_df.get(args.id_col, pd.Series(np.arange(len(val_df)))).astype(str).tolist(), "smiles": val_df[args.smiles_col].astype(str).tolist(), "y_true": val_df[args.label_col].to_numpy(dtype=float), "y_logit": np.log(np.clip(va_prob, 1e-7, 1 - 1e-7) / np.clip(1 - va_prob, 1e-7, 1 - 1e-7)), "y_proba": va_prob, "y_pred_label": (va_prob >= 0.5).astype(int)}
+                            result["test_pred"] = {"ids": test_df.get(args.id_col, pd.Series(np.arange(len(test_df)))).astype(str).tolist(), "smiles": test_df[args.smiles_col].astype(str).tolist(), "y_true": test_df[args.label_col].to_numpy(dtype=float), "y_logit": np.log(np.clip(te_prob, 1e-7, 1 - 1e-7) / np.clip(1 - te_prob, 1e-7, 1 - 1e-7)), "y_proba": te_prob, "y_pred_label": (te_prob >= 0.5).astype(int)}
+                            result["val_metrics"] = evaluate_classification(result["val_pred"]["y_true"], result["val_pred"]["y_proba"])
+                            result["test_metrics"] = evaluate_classification(result["test_pred"]["y_true"], result["test_pred"]["y_proba"])
+                    except Exception as exc:
+                        print(f"[WARN] Chemprop failed for seed={seed} task={task} with error: {exc}. Falling back to torch_fallback.")
+                        task_backend = "torch_fallback"
+                        result = train_torch_task(task, args, seed, ensemble_id, seed_dir, train_items, val_items, test_items, device, target_scaler=target_scaler)
+                else:
+                    result = train_torch_task(task, args, seed, ensemble_id, seed_dir, train_items, val_items, test_items, device, target_scaler=target_scaler)
+                member_results.append(result)
+                seed_train_time += safe_float(result.get("train_time_sec", 0.0))
+                seed_predict_time += safe_float(result.get("predict_time_sec", 0.0))
 
             if task == "regression":
-                hist = result["history"]
-                hist.to_csv(seed_dir / "training_log_regression.csv", index=False)
-                metrics_df = pd.DataFrame(
-                    [
-                        {"model_name": "dmpnn", "split": "val", **result["val_metrics"], "seed": seed},
-                        {"model_name": "dmpnn", "split": "test", **result["test_metrics"], "seed": seed},
-                    ]
-                )
+                hist_df = pd.concat([x["history"] for x in member_results if not x["history"].empty], ignore_index=True) if member_results else pd.DataFrame()
+                hist_df.to_csv(seed_dir / "training_log_regression.csv", index=False)
+
+                member_rows: List[Dict[str, Any]] = []
+                member_metrics: List[Dict[str, Any]] = []
+                for ens_id, result in enumerate(member_results):
+                    for split_name in ["train", "val", "test"]:
+                        member_rows.extend(prediction_dict_to_rows("regression", seed, ens_id, "dmpnn_member", split_name, result[f"{split_name}_pred"]))
+                    member_metrics.append({"seed": seed, "ensemble_id": ens_id, "model_name": "dmpnn_member", "split": "val", **result["val_metrics"]})
+                    member_metrics.append({"seed": seed, "ensemble_id": ens_id, "model_name": "dmpnn_member", "split": "test", **result["test_metrics"]})
+
+                member_pred_df = pd.DataFrame(member_rows)
+                ens_pred_df = aggregate_predictions(member_pred_df, "regression", args.ensemble_mode)
+                pred_df = pd.concat([member_pred_df, ens_pred_df], ignore_index=True)
+                pred_df.to_csv(seed_dir / "predictions_regression.csv", index=False)
+
+                metrics_member_df = pd.DataFrame(member_metrics)
+                metrics_member_df.to_csv(seed_dir / "metrics_regression_members.csv", index=False)
+                metrics_df = evaluate_ensemble_metrics(ens_pred_df, "regression", seed)
                 metrics_df.to_csv(seed_dir / "metrics_regression.csv", index=False)
 
-                pred_rows: List[Dict[str, Any]] = []
-                for split_name, pred in [("val", result["val_pred"]), ("test", result["test_pred"])]:
-                    for i in range(len(pred["ids"])):
-                        pred_rows.append(
-                            {
-                                "seed": seed,
-                                "split": split_name,
-                                "id": pred["ids"][i],
-                                "smiles": pred["smiles"][i],
-                                "y_true": pred["y_true"][i],
-                                "y_pred": pred["y_pred"][i],
-                            }
-                        )
-                pred_df = pd.DataFrame(pred_rows)
-                pred_df.to_csv(seed_dir / "predictions_regression.csv", index=False)
                 all_reg_preds.append(pred_df)
                 all_reg_metrics.extend(metrics_df.to_dict(orient="records"))
 
-                if args.export_embeddings and "embeddings" in result["test_pred"]:
-                    emb = result["test_pred"]["embeddings"]
-                    if emb.ndim == 2 and emb.shape[0] == len(result["test_pred"]["ids"]):
+                first_result = member_results[0]
+                if args.export_embeddings and "embeddings" in first_result["test_pred"]:
+                    emb = first_result["test_pred"]["embeddings"]
+                    if emb.ndim == 2 and emb.shape[0] == len(first_result["test_pred"]["ids"]):
                         emb_df = pd.DataFrame(emb)
-                        emb_df.insert(0, "id", result["test_pred"]["ids"])
-                        emb_df.insert(1, "smiles", result["test_pred"]["smiles"])
+                        emb_df.insert(0, "id", first_result["test_pred"]["ids"])
+                        emb_df.insert(1, "smiles", first_result["test_pred"]["smiles"])
                         emb_df.to_csv(seed_dir / "test_embeddings_regression.csv", index=False)
 
             if task == "classification":
-                hist = result["history"]
-                hist.to_csv(seed_dir / "training_log_classification.csv", index=False)
-                cm_val = classification_at_threshold(result["val_pred"]["y_true"], result["val_pred"]["y_proba"])
-                cm_test = classification_at_threshold(result["test_pred"]["y_true"], result["test_pred"]["y_proba"])
-                metrics_df = pd.DataFrame(
-                    [
-                        {"split": "val", **result["val_metrics"], "seed": seed},
-                        {"split": "test", **result["test_metrics"], "seed": seed},
-                    ]
-                )
-                metrics_df.to_csv(seed_dir / "metrics_classification.csv", index=False)
+                hist_df = pd.concat([x["history"] for x in member_results if not x["history"].empty], ignore_index=True) if member_results else pd.DataFrame()
+                hist_df.to_csv(seed_dir / "training_log_classification.csv", index=False)
 
+                member_rows = []
+                for ens_id, result in enumerate(member_results):
+                    for split_name in ["train", "val", "test"]:
+                        member_rows.extend(prediction_dict_to_rows("classification", seed, ens_id, "dmpnn_member", split_name, result[f"{split_name}_pred"]))
+                member_pred_df = pd.DataFrame(member_rows)
+                ens_pred_df = aggregate_predictions(member_pred_df, "classification", args.ensemble_mode)
+                pred_df = pd.concat([member_pred_df, ens_pred_df], ignore_index=True)
+                pred_df.to_csv(seed_dir / "predictions_classification.csv", index=False)
+
+                metrics_df = evaluate_ensemble_metrics(ens_pred_df, "classification", seed)
+                metrics_df.to_csv(seed_dir / "metrics_classification.csv", index=False)
+                cm_test = classification_at_threshold(
+                    ens_pred_df[ens_pred_df["split"] == "test"]["y_true"].to_numpy(dtype=float),
+                    ens_pred_df[ens_pred_df["split"] == "test"]["y_proba"].to_numpy(dtype=float),
+                )
                 pd.DataFrame([{"split": "test", **cm_test, "seed": seed}]).to_csv(seed_dir / "confusion_matrix_test.csv", index=False)
 
-                pred_rows: List[Dict[str, Any]] = []
-                for split_name, pred in [("val", result["val_pred"]), ("test", result["test_pred"])]:
-                    for i in range(len(pred["ids"])):
-                        pred_rows.append(
-                            {
-                                "seed": seed,
-                                "split": split_name,
-                                "id": pred["ids"][i],
-                                "smiles": pred["smiles"][i],
-                                "y_true": pred["y_true"][i],
-                                "y_logit": pred["y_logit"][i],
-                                "y_proba": pred["y_proba"][i],
-                                "y_pred_label": pred["y_pred_label"][i],
-                            }
-                        )
-                pred_df = pd.DataFrame(pred_rows)
-                pred_df.to_csv(seed_dir / "predictions_classification.csv", index=False)
                 all_cls_preds.append(pred_df)
                 all_cls_metrics.extend(metrics_df.to_dict(orient="records"))
 
-                if args.export_embeddings and "embeddings" in result["test_pred"]:
-                    emb = result["test_pred"]["embeddings"]
-                    if emb.ndim == 2 and emb.shape[0] == len(result["test_pred"]["ids"]):
+                first_result = member_results[0]
+                if args.export_embeddings and "embeddings" in first_result["test_pred"]:
+                    emb = first_result["test_pred"]["embeddings"]
+                    if emb.ndim == 2 and emb.shape[0] == len(first_result["test_pred"]["ids"]):
                         emb_df = pd.DataFrame(emb)
-                        emb_df.insert(0, "id", result["test_pred"]["ids"])
-                        emb_df.insert(1, "smiles", result["test_pred"]["smiles"])
+                        emb_df.insert(0, "id", first_result["test_pred"]["ids"])
+                        emb_df.insert(1, "smiles", first_result["test_pred"]["smiles"])
                         emb_df.to_csv(seed_dir / "test_embeddings_classification.csv", index=False)
 
-            print(f"[INFO] Seed {seed} task={task} complete. Best metrics val={result.get('val_metrics')} test={result.get('test_metrics')}")
+            print(f"[INFO] Seed {seed} task={task} complete. backend={task_backend}")
 
         pd.DataFrame([{"seed": seed, "featurize_time_sec": feat_time, "train_time_sec": seed_train_time, "predict_time_sec": seed_predict_time}]).to_csv(seed_dir / "timing.csv", index=False)
 
@@ -1240,7 +1298,7 @@ def main() -> None:
                 "pandas_version": pd.__version__,
                 "torch_version": torch.__version__,
                 "rdkit_version": getattr(Chem, "__version__", "unknown"),
-                "chemprop_version": (subprocess.run([sys.executable, "-c", "import chemprop; print(chemprop.__version__)"] ,capture_output=True,text=True).stdout.strip() if backend == "chemprop" else "not_installed"),
+                "chemprop_version": (subprocess.run([sys.executable, "-c", "import chemprop; print(chemprop.__version__)"], capture_output=True, text=True).stdout.strip() if backend == "chemprop" else "not_installed"),
                 "device": str(device),
                 "train_sha256": sha256_file(train_csv),
                 "val_sha256": sha256_file(val_csv),
@@ -1258,7 +1316,7 @@ def main() -> None:
         f.write(f"Backend selected: {backend}\n")
         f.write(f"Seeds: {seeds}\n")
         f.write(f"Task: {args.task}\n")
-        f.write(f"Determinism: python/numpy/torch seeded; cudnn deterministic=True and benchmark=False on CUDA.\n")
+        f.write("Determinism: python/numpy/torch seeded; cudnn deterministic=True and benchmark=False on CUDA.\n")
         f.write(f"Manifest CSV: {outdir / 'run_manifest.csv'}\n")
 
     if all_reg_metrics:
