@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,6 +74,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--task", type=str, default="both", choices=["regression", "classification", "both"], help="Task type.")
     parser.add_argument("--radius", type=int, default=2, help="Morgan fingerprint radius.")
     parser.add_argument("--n_bits", type=int, default=2048, help="Morgan fingerprint nBits.")
+    parser.add_argument("--smiles_col", type=str, default="rdkit_canonical_smiles", help="SMILES column name.")
+    parser.add_argument("--id_col", type=str, default="molecule_chembl_id", help="Molecule ID column name.")
+    parser.add_argument("--target_col", type=str, default="pIC50", help="Regression target column name.")
+    parser.add_argument("--label_col", type=str, default="Active", help="Classification label column name.")
     parser.add_argument("--title_size", type=int, default=14, help="Plot title font size.")
     parser.add_argument("--label_size", type=int, default=12, help="Axis label font size.")
     parser.add_argument("--tick_size", type=int, default=10, help="Tick label font size.")
@@ -150,6 +155,33 @@ def infer_columns(df: pd.DataFrame) -> Tuple[str, str, str]:
     return id_col, smiles_col, target_col
 
 
+def cli_arg_was_explicit(arg_name: str) -> bool:
+    """Return True if CLI arg was explicitly provided by the user."""
+    flag = f"--{arg_name}"
+    return any(tok == flag or tok.startswith(f"{flag}=") for tok in sys.argv[1:])
+
+
+def resolve_column(
+    df: pd.DataFrame,
+    requested_col: str,
+    explicitly_set: bool,
+    fallback_candidates: Optional[Sequence[str]] = None,
+    kind: str = "column",
+) -> str:
+    """Resolve a column name with optional fallback behavior."""
+    if requested_col in df.columns:
+        return requested_col
+    if explicitly_set:
+        raise ValueError(
+            f"Requested {kind} '{requested_col}' was not found. Available columns: {list(df.columns)}"
+        )
+    if fallback_candidates is not None:
+        for candidate in fallback_candidates:
+            if candidate in df.columns:
+                return candidate
+    raise ValueError(f"Required {kind} '{requested_col}' was not found. Available columns: {list(df.columns)}")
+
+
 def canonicalize_smiles(smiles: Any) -> Optional[str]:
     """Return canonical SMILES if possible."""
     if not isinstance(smiles, str) or not smiles.strip():
@@ -177,13 +209,13 @@ def featurize_smiles(smiles_list: Sequence[Any], radius: int, n_bits: int) -> np
     return feats
 
 
-def build_regression_models(include_xgb: bool) -> Dict[str, Any]:
+def build_regression_models(include_xgb: bool, seed: int) -> Dict[str, Any]:
     """Construct regression model dict."""
     models: Dict[str, Any] = {
         "ridge": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", Ridge(alpha=1.0))]),
         "svr_rbf": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", SVR(C=10.0, gamma="scale"))]),
-        "rf": RandomForestRegressor(n_estimators=400, random_state=0, n_jobs=-1),
-        "gbr": GradientBoostingRegressor(random_state=0),
+        "rf": RandomForestRegressor(n_estimators=400, random_state=seed, n_jobs=-1),
+        "gbr": GradientBoostingRegressor(random_state=seed),
         "knn": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", KNeighborsRegressor(n_neighbors=7))]),
     }
     if include_xgb:
@@ -196,19 +228,19 @@ def build_regression_models(include_xgb: bool) -> Dict[str, Any]:
             subsample=0.9,
             colsample_bytree=0.9,
             objective="reg:squarederror",
-            random_state=0,
+            random_state=seed,
             n_jobs=-1,
         )
     return models
 
 
-def build_classification_models(include_xgb: bool) -> Dict[str, Any]:
+def build_classification_models(include_xgb: bool, seed: int) -> Dict[str, Any]:
     """Construct classification model dict."""
     models: Dict[str, Any] = {
         "logreg": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", LogisticRegression(max_iter=3000, n_jobs=-1))]),
-        "svc_rbf": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", SVC(probability=True, C=3.0, gamma="scale", random_state=0))]),
-        "rf": RandomForestClassifier(n_estimators=400, random_state=0, n_jobs=-1),
-        "gbc": GradientBoostingClassifier(random_state=0),
+        "svc_rbf": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", SVC(probability=True, C=3.0, gamma="scale", random_state=seed))]),
+        "rf": RandomForestClassifier(n_estimators=400, random_state=seed, n_jobs=-1),
+        "gbc": GradientBoostingClassifier(random_state=seed),
         "knn": Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value=0.0)), ("scaler", StandardScaler()), ("model", KNeighborsClassifier(n_neighbors=11))]),
     }
     if include_xgb:
@@ -222,7 +254,7 @@ def build_classification_models(include_xgb: bool) -> Dict[str, Any]:
             colsample_bytree=0.9,
             objective="binary:logistic",
             eval_metric="logloss",
-            random_state=0,
+            random_state=seed,
             n_jobs=-1,
         )
     return models
@@ -467,9 +499,9 @@ def model_params_as_json(model: Any) -> str:
     return json.dumps(params, sort_keys=True, default=str)
 
 
-def maybe_has_classification_data(train_df: pd.DataFrame, target_col: str) -> bool:
+def maybe_has_classification_data(train_df: pd.DataFrame, label_col: str) -> bool:
     """Heuristic to decide if classification can be run."""
-    y = train_df[target_col].dropna().values
+    y = train_df[label_col].dropna().values
     unique = np.unique(y)
     if len(unique) <= 1:
         return False
@@ -522,7 +554,49 @@ def run() -> None:
         val_df = read_table(files["val"]).copy()
         test_df = read_table(files["test"]).copy()
 
-        id_col, smiles_col, target_col = infer_columns(train_df)
+        explicit_id_col = cli_arg_was_explicit("id_col")
+        explicit_smiles_col = cli_arg_was_explicit("smiles_col")
+        explicit_target_col = cli_arg_was_explicit("target_col")
+        explicit_label_col = cli_arg_was_explicit("label_col")
+
+        id_col = resolve_column(
+            train_df,
+            args.id_col,
+            explicitly_set=explicit_id_col,
+            fallback_candidates=["molecule_chembl_id", "id"],
+            kind="id column",
+        )
+        smiles_col = resolve_column(
+            train_df,
+            args.smiles_col,
+            explicitly_set=explicit_smiles_col,
+            fallback_candidates=["rdkit_canonical_smiles", "canonical_smiles", "smiles"],
+            kind="smiles column",
+        )
+        target_col = resolve_column(
+            train_df,
+            args.target_col,
+            explicitly_set=explicit_target_col,
+            fallback_candidates=None,
+            kind="target column",
+        )
+        label_col = resolve_column(
+            train_df,
+            args.label_col,
+            explicitly_set=explicit_label_col,
+            fallback_candidates=None,
+            kind="label column",
+        )
+
+        print(f"resolved columns: id={id_col}, smiles={smiles_col}, target={target_col}, label={label_col}")
+
+        for split_name, df in [("val", val_df), ("test", test_df)]:
+            missing_cols = [c for c in [smiles_col, target_col, label_col] if c not in df.columns]
+            if missing_cols:
+                raise ValueError(
+                    f"Missing required columns in {split_name} split: {missing_cols}. "
+                    f"Available columns: {list(df.columns)}"
+                )
         for df in [val_df, test_df]:
             if id_col not in df.columns:
                 df[id_col] = np.arange(len(df))
@@ -539,13 +613,13 @@ def run() -> None:
         y_test = test_df[target_col].astype(float).values
 
         run_reg = args.task in {"regression", "both"}
-        run_cls = args.task in {"classification", "both"} and maybe_has_classification_data(train_df, target_col)
+        run_cls = args.task in {"classification", "both"} and maybe_has_classification_data(train_df, label_col)
 
         if args.task in {"classification", "both"} and not run_cls:
-            print(f"seed {seed}: classification skipped (target is not binary-like).")
+            print(f"seed {seed}: classification skipped (label is not binary-like).")
 
         if run_reg:
-            models_reg = build_regression_models(include_xgb)
+            models_reg = build_regression_models(include_xgb, seed)
             for model_name, model in models_reg.items():
                 print(f"training each model: regression/{model_name} (seed={seed})")
                 model_instance = clone(model)
@@ -587,8 +661,8 @@ def run() -> None:
                                 "seed": seed,
                                 "model": model_name,
                                 "split": split_name,
-                                "molecule_chembl_id": row.get(id_col),
-                                "rdkit_canonical_smiles": canonicalize_smiles(row.get(smiles_col)),
+                                id_col: row.get(id_col),
+                                smiles_col: row.get(smiles_col),
                                 "y_true": float(y_split[row_idx]),
                                 "y_pred": float(y_pred[row_idx]),
                             }
@@ -604,10 +678,10 @@ def run() -> None:
                 )
 
         if run_cls:
-            y_train_cls = train_df[target_col].astype(int).values
-            y_val_cls = val_df[target_col].astype(int).values
-            y_test_cls = test_df[target_col].astype(int).values
-            models_cls = build_classification_models(include_xgb)
+            y_train_cls = train_df[label_col].astype(int).values
+            y_val_cls = val_df[label_col].astype(int).values
+            y_test_cls = test_df[label_col].astype(int).values
+            models_cls = build_classification_models(include_xgb, seed)
 
             for model_name, model in models_cls.items():
                 print(f"training each model: classification/{model_name} (seed={seed})")
@@ -651,8 +725,8 @@ def run() -> None:
                                 "seed": seed,
                                 "model": model_name,
                                 "split": split_name,
-                                "id": row.get(id_col),
-                                "smiles": row.get(smiles_col),
+                                id_col: row.get(id_col),
+                                smiles_col: row.get(smiles_col),
                                 "y_true": int(y_split[row_idx]),
                                 "y_proba": float(y_proba[row_idx]),
                                 "y_pred_label": int(y_pred_label[row_idx]),
