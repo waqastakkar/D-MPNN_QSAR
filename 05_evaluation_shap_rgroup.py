@@ -205,7 +205,8 @@ def standardize_prediction_table(
 
 def regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     """Compute regression metrics with robust Pearson handling."""
-    rmse = float(mean_squared_error(y_true, y_pred, squared=False))
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
     mae = float(mean_absolute_error(y_true, y_pred))
     r2 = float(r2_score(y_true, y_pred))
     if len(y_true) > 1 and np.std(y_true) > 0 and np.std(y_pred) > 0:
