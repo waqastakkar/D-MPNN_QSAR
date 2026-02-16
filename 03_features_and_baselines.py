@@ -17,6 +17,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import joblib
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from sklearn.base import clone
@@ -78,6 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--id_col", type=str, default="molecule_chembl_id", help="Molecule ID column name.")
     parser.add_argument("--target_col", type=str, default="pIC50", help="Regression target column name.")
     parser.add_argument("--label_col", type=str, default="Active", help="Classification label column name.")
+    parser.add_argument("--save_models", action="store_true", help="Save fitted baseline models and feature config.")
     parser.add_argument("--title_size", type=int, default=14, help="Plot title font size.")
     parser.add_argument("--label_size", type=int, default=12, help="Axis label font size.")
     parser.add_argument("--tick_size", type=int, default=10, help="Tick label font size.")
@@ -517,6 +519,9 @@ def run() -> None:
     args = parse_args()
     seeds = parse_seed_list(args.seeds)
     ensure_dir(args.outdir)
+    model_outdir = args.outdir / "models"
+    if args.save_models:
+        ensure_dir(model_outdir)
 
     include_xgb = False
     try:
@@ -589,6 +594,19 @@ def run() -> None:
         )
 
         print(f"resolved columns: id={id_col}, smiles={smiles_col}, target={target_col}, label={label_col}")
+
+        if args.save_models:
+            feature_config = {
+                "radius": args.radius,
+                "n_bits": args.n_bits,
+                "use_chirality": True,
+                "smiles_col": smiles_col,
+                "id_col": id_col,
+                "target_col": target_col,
+                "label_col": label_col,
+            }
+            with open(model_outdir / "feature_config.json", "w", encoding="utf-8") as f:
+                json.dump(feature_config, f, indent=2)
 
         for split_name, df in [("val", val_df), ("test", test_df)]:
             missing_cols = [c for c in [smiles_col, target_col, label_col] if c not in df.columns]
@@ -677,6 +695,9 @@ def run() -> None:
                     }
                 )
 
+                if args.save_models:
+                    joblib.dump(model_instance, model_outdir / f"{model_name}_seed{seed}.joblib")
+
         if run_cls:
             y_train_cls = train_df[label_col].astype(int).values
             y_val_cls = val_df[label_col].astype(int).values
@@ -741,6 +762,9 @@ def run() -> None:
                         "params_json": model_params_as_json(model_instance),
                     }
                 )
+
+                if args.save_models:
+                    joblib.dump(model_instance, model_outdir / f"{model_name}_seed{seed}.joblib")
 
         seed_metrics_reg = pd.DataFrame([r for r in metrics_reg_rows if r["seed"] == seed])
         seed_metrics_cls = pd.DataFrame([r for r in metrics_cls_rows if r["seed"] == seed])
