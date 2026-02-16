@@ -104,11 +104,11 @@ def safe_mol_from_smiles(smiles: str) -> Optional[Chem.Mol]:
     return Chem.MolFromSmiles(smi)
 
 
-def morgan_fp(smiles: str, radius: int, nbits: int) -> Optional[DataStructs.cDataStructs.ExplicitBitVect]:
+def morgan_fp(smiles: str, radius: int, nbits: int, use_chirality: bool = True) -> Optional[DataStructs.cDataStructs.ExplicitBitVect]:
     mol = safe_mol_from_smiles(smiles)
     if mol is None:
         return None
-    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits, useChirality=True)
+    return AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nbits, useChirality=use_chirality)
 
 
 def write_manifest(path: Path, args: argparse.Namespace, n_models: int, xgb_found: bool) -> None:
@@ -265,6 +265,17 @@ def maybe_predict_xgb(lib_df: pd.DataFrame, args: argparse.Namespace, smiles_col
     if not models_dir.exists() or joblib is None:
         return np.full((len(lib_df),), np.nan), False
 
+    feature_config_path = models_dir / "feature_config.json"
+    if feature_config_path.exists():
+        feature_config = json.loads(feature_config_path.read_text(encoding="utf-8"))
+        fp_radius = int(feature_config["radius"])
+        fp_nbits = int(feature_config["n_bits"])
+        fp_use_chirality = bool(feature_config.get("use_chirality", True))
+    else:
+        fp_radius = int(args.ad_radius)
+        fp_nbits = int(args.ad_nbits)
+        fp_use_chirality = True
+
     seeds = parse_seeds(args.seeds)
     model_files: List[Path] = []
     for s in seeds:
@@ -277,12 +288,12 @@ def maybe_predict_xgb(lib_df: pd.DataFrame, args: argparse.Namespace, smiles_col
     if not model_files:
         return np.full((len(lib_df),), np.nan), False
 
-    fps = np.zeros((len(lib_df), args.ad_nbits), dtype=np.float32)
+    fps = np.zeros((len(lib_df), fp_nbits), dtype=np.float32)
     for i, smi in enumerate(lib_df[smiles_col].astype(str)):
-        fp = morgan_fp(smi, radius=2, nbits=args.ad_nbits)
+        fp = morgan_fp(smi, radius=fp_radius, nbits=fp_nbits, use_chirality=fp_use_chirality)
         if fp is None:
             continue
-        arr = np.zeros((args.ad_nbits,), dtype=np.int8)
+        arr = np.zeros((fp_nbits,), dtype=np.int8)
         DataStructs.ConvertToNumpyArray(fp, arr)
         fps[i] = arr
 
@@ -415,10 +426,13 @@ def main() -> None:
     if args.consensus:
         xgb_pred, xgb_avail = maybe_predict_xgb(scored_df, args, smiles_col)
         if not xgb_avail:
-            print("[WARN] XGB models not found. Consensus uses NaN.")
+            print("[WARN] XGB models not found. Consensus falls back to DMPNN.")
 
     scored_df["pred_pIC50_xgb"] = xgb_pred
-    scored_df["pred_pIC50_consensus"] = 0.5 * scored_df["pred_pIC50_dmpnn"] + 0.5 * scored_df["pred_pIC50_xgb"]
+    if xgb_avail:
+        scored_df["pred_pIC50_consensus"] = 0.5 * scored_df["pred_pIC50_dmpnn"] + 0.5 * scored_df["pred_pIC50_xgb"]
+    else:
+        scored_df["pred_pIC50_consensus"] = scored_df["pred_pIC50_dmpnn"]
 
     scored_df.to_csv(outdir / "library_scored_with_ad.csv", index=False)
 
@@ -427,7 +441,7 @@ def main() -> None:
     if xgb_avail:
         ranked_df["rank_consensus"] = ranked_df["pred_pIC50_consensus"].rank(method="first", ascending=False).astype("Int64")
     else:
-        ranked_df["rank_consensus"] = pd.Series([pd.NA] * len(ranked_df), dtype="Int64")
+        ranked_df["rank_consensus"] = ranked_df["rank_dmpnn"]
 
     ranked_df.to_csv(outdir / "library_ranked.csv", index=False)
 
@@ -437,7 +451,8 @@ def main() -> None:
     n_cons = max(1, int(np.ceil(len(in_domain) * (args.top_consensus_pct / 100.0)))) if len(in_domain) > 0 else 0
     n_nov = max(1, int(np.ceil(len(novel) * (args.top_novel_pct / 100.0)))) if len(novel) > 0 else 0
 
-    top_cons = in_domain.sort_values("pred_pIC50_consensus", ascending=False).head(n_cons)
+    cons_sort_col = "pred_pIC50_consensus" if xgb_avail else "pred_pIC50_dmpnn"
+    top_cons = in_domain.sort_values(cons_sort_col, ascending=False).head(n_cons)
     top_nov = novel.sort_values("pred_pIC50_dmpnn", ascending=False).head(n_nov)
 
     top = pd.concat([top_cons, top_nov], ignore_index=True)
