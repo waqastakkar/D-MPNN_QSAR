@@ -45,6 +45,9 @@ PALETTE = {
     "red2": "#BB0021",
 }
 
+DEFAULT_ID_CANDIDATES = ["id", "molecule_chembl_id", "Catalog_NO", "compound_id", "ID"]
+DEFAULT_SMILES_CANDIDATES = ["smiles", "rdkit_canonical_smiles", "canonical_smiles", "SMILES", "Smiles"]
+
 
 @dataclass
 class Args:
@@ -82,6 +85,38 @@ def parse_bool_flag(value: str) -> bool:
     if value_l in {"0", "false", "f", "no", "n"}:
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def pick_first_existing(df: pd.DataFrame, candidates: Sequence[str]) -> Optional[str]:
+    """Return the first candidate column that exists in DataFrame, else None."""
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def ensure_id_smiles(
+    df: pd.DataFrame,
+    id_candidates: Optional[Sequence[str]] = None,
+    smiles_candidates: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
+    """Ensure canonical id/smiles aliases are present where possible."""
+    if id_candidates is None:
+        id_candidates = DEFAULT_ID_CANDIDATES
+    if smiles_candidates is None:
+        smiles_candidates = DEFAULT_SMILES_CANDIDATES
+
+    id_col = pick_first_existing(df, id_candidates)
+    if id_col is None:
+        raise ValueError(f"No ID column found. Available columns: {list(df.columns)}")
+    if id_col != "id":
+        df["id"] = df[id_col].astype(str)
+
+    smi_col = pick_first_existing(df, smiles_candidates)
+    if smi_col is not None and smi_col != "smiles":
+        df["smiles"] = df[smi_col].astype(str)
+
+    return df
 
 
 def parse_args() -> Args:
@@ -162,20 +197,12 @@ def ensure_columns(df: pd.DataFrame, required: Sequence[str], source_name: str) 
 
 def identify_id_column(df: pd.DataFrame) -> Optional[str]:
     """Choose identifier column if present."""
-    candidates = ["molecule_chembl_id", "id", "molecule_id", "compound_id"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+    return pick_first_existing(df, ["id", "molecule_chembl_id", "Catalog_NO", "compound_id", "ID", "molecule_id"])
 
 
 def identify_smiles_column(df: pd.DataFrame) -> Optional[str]:
     """Choose smiles column if present."""
-    candidates = ["rdkit_canonical_smiles", "smiles", "canonical_smiles"]
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
+    return pick_first_existing(df, ["smiles", "rdkit_canonical_smiles", "canonical_smiles", "SMILES", "Smiles"])
 
 
 def load_and_standardize_predictions(path: Path, default_model: Optional[str] = None) -> pd.DataFrame:
@@ -406,6 +433,8 @@ def main() -> None:
 
     baseline_raw = load_and_standardize_predictions(baseline_path)
     dmpnn_raw = load_and_standardize_predictions(dmpnn_path, default_model=args.dmpnn_name)
+    baseline_raw = ensure_id_smiles(baseline_raw)
+    dmpnn_raw = ensure_id_smiles(dmpnn_raw)
 
     baseline_df = filter_split_and_seeds(baseline_raw, args.split, args.seeds, "baselines")
     dmpnn_df = filter_split_and_seeds(dmpnn_raw, args.split, args.seeds, "dmpnn")
@@ -478,6 +507,30 @@ def main() -> None:
         if b_seed.empty or d_seed.empty:
             raise ValueError(f"Missing baseline or dmpnn rows for seed {seed} on split {args.split}.")
         aligned = align_two_models_for_seed(b_seed, d_seed, seed)
+        if "id" not in aligned.columns:
+            if "row_id" in aligned.columns:
+                aligned["id"] = aligned["row_id"].astype(str)
+            else:
+                aligned["id"] = np.arange(len(aligned)).astype(str)
+        if "smiles" not in aligned.columns:
+            smiles_alias_source = pick_first_existing(
+                aligned,
+                [
+                    "smiles_baseline",
+                    "rdkit_canonical_smiles_baseline",
+                    "canonical_smiles_baseline",
+                    "SMILES_baseline",
+                    "Smiles_baseline",
+                    "smiles_dmpnn",
+                    "rdkit_canonical_smiles_dmpnn",
+                    "canonical_smiles_dmpnn",
+                    "SMILES_dmpnn",
+                    "Smiles_dmpnn",
+                ],
+            )
+            if smiles_alias_source is not None:
+                aligned["smiles"] = aligned[smiles_alias_source].astype(str)
+        aligned = ensure_id_smiles(aligned, id_candidates=["id", "row_id"])
         aligned["seed"] = seed
         aligned_seed_dfs.append(aligned)
 
@@ -551,8 +604,28 @@ def main() -> None:
         else:
             ids = np.arange(len(ali))
 
-        smi_baseline_col = "rdkit_canonical_smiles_baseline" if "rdkit_canonical_smiles_baseline" in ali.columns else None
-        smi_dmpnn_col = "rdkit_canonical_smiles_dmpnn" if "rdkit_canonical_smiles_dmpnn" in ali.columns else None
+        smi_baseline_col = pick_first_existing(
+            ali,
+            [
+                "smiles_baseline",
+                "rdkit_canonical_smiles_baseline",
+                "canonical_smiles_baseline",
+                "SMILES_baseline",
+                "Smiles_baseline",
+                "smiles",
+            ],
+        )
+        smi_dmpnn_col = pick_first_existing(
+            ali,
+            [
+                "smiles_dmpnn",
+                "rdkit_canonical_smiles_dmpnn",
+                "canonical_smiles_dmpnn",
+                "SMILES_dmpnn",
+                "Smiles_dmpnn",
+                "smiles",
+            ],
+        )
 
         for model_name, yt_col, yp_col, smi_col in [
             (chosen_baseline, "y_true_baseline", "y_pred_baseline", smi_baseline_col),
@@ -635,7 +708,7 @@ def main() -> None:
         error_df.loc[error_df["model"] == chosen_baseline, "abs_error"].to_numpy(),
         error_df.loc[error_df["model"] == args.dmpnn_name, "abs_error"].to_numpy(),
     ]
-    bp = ax.boxplot(data, labels=two_models, patch_artist=True)
+    bp = ax.boxplot(data, tick_labels=two_models, patch_artist=True)
     for patch, color in zip(bp["boxes"], [PALETTE["blue"], PALETTE["orange"]]):
         patch.set_facecolor(color)
         patch.set_alpha(0.85)
@@ -670,25 +743,35 @@ def main() -> None:
             train_df = pd.read_csv(split_seed_train)
             train_smiles_col = identify_smiles_column(train_df)
             if train_smiles_col is None:
-                raise ValueError(f"No SMILES column found in {split_seed_train}; expected one of rdkit_canonical_smiles/smiles.")
+                raise ValueError(f"No SMILES column found in {split_seed_train}; expected canonical SMILES column.")
             train_smiles = train_df[train_smiles_col].astype(str).tolist()
 
             err_seed = error_df[error_df["seed"] == seed].copy()
-            smiles_for_seed = err_seed[["id", "smiles"]].dropna().drop_duplicates()
+            err_seed = ensure_id_smiles(err_seed)
+            if "smiles" in err_seed.columns:
+                smiles_for_seed = err_seed[["id", "smiles"]].dropna().drop_duplicates()
+            else:
+                smiles_for_seed = pd.DataFrame(columns=["id", "smiles"])
+
             if smiles_for_seed.empty:
-                split_seed_test = args.splits_dir / f"seed_{seed}" / "test.csv"
-                if not split_seed_test.exists():
+                split_seed_eval = args.splits_dir / f"seed_{seed}" / f"{args.split}.csv"
+                if not split_seed_eval.exists():
                     raise FileNotFoundError(
-                        f"No smiles in predictions and test split missing for seed {seed}: {split_seed_test}"
+                        f"No smiles in predictions and split file missing for seed {seed}: {split_seed_eval}"
                     )
-                test_df = pd.read_csv(split_seed_test)
-                test_smiles_col = identify_smiles_column(test_df)
-                test_id_col = identify_id_column(test_df)
-                if test_smiles_col is None:
-                    raise ValueError(f"No SMILES column found in {split_seed_test} for AD analysis.")
-                if test_id_col is None:
-                    raise ValueError(f"No ID column in {split_seed_test}; cannot map test molecules for AD analysis.")
-                smiles_for_seed = test_df[[test_id_col, test_smiles_col]].rename(columns={test_id_col: "id", test_smiles_col: "smiles"})
+                eval_df = pd.read_csv(split_seed_eval)
+                eval_id_col = pick_first_existing(eval_df, DEFAULT_ID_CANDIDATES)
+                eval_smiles_col = pick_first_existing(eval_df, DEFAULT_SMILES_CANDIDATES)
+                if eval_id_col is None:
+                    raise ValueError(f"No ID column found in {split_seed_eval}; cannot map molecules for AD analysis.")
+                if eval_smiles_col is None:
+                    raise ValueError(f"No SMILES column found in {split_seed_eval} for AD analysis.")
+                smiles_for_seed = pd.DataFrame(
+                    {
+                        "id": eval_df[eval_id_col].astype(str),
+                        "smiles": eval_df[eval_smiles_col].astype(str),
+                    }
+                ).dropna().drop_duplicates()
 
             nn = compute_nn_similarity(
                 train_smiles=train_smiles,
@@ -698,7 +781,10 @@ def main() -> None:
             )
             sim_df = smiles_for_seed.copy()
             sim_df["nn_similarity"] = nn
-            merged = err_seed.merge(sim_df, on=["id", "smiles"], how="left")
+            if "smiles" in err_seed.columns:
+                merged = err_seed.merge(sim_df, on=["id", "smiles"], how="left")
+            else:
+                merged = err_seed.merge(sim_df, on=["id"], how="left")
             for _, r in merged.iterrows():
                 ad_rows.append(
                     {
